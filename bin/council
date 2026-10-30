@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# council — Council ensemble operator dispatcher (plain shell, no Node, no host services).
+#
+# Frames a task, prepends Council's operator identity (IDENTITY.md) and an optional
+# protocol preamble, runs it on the engine CLI you configure, and writes a run log.
+#
+# Usage:
+#   council "Cross-check this plan and execute the safe parts"
+#   council --advisory "Which operator should take this task?"
+#   council --file task.md
+#   echo "long task…" | council
+#
+# Flags:
+#   -m, --model NAME   Model override (default: $COUNCIL_MODEL)
+#   -f, --file PATH    Read the task from a file
+#       --advisory     Read-only run (uses COUNCIL_ADVISORY_ARGS)
+#       --no-exec      Build the task and write the run log, don't run the engine
+#   -h, --help         Show this help
+#
+# Environment:
+#   COUNCIL_ENGINE_CLI    (required) engine command with a `-p <prompt>` mode
+#   COUNCIL_MODEL         model passed as --model (optional)
+#   COUNCIL_ENV_UNSET     space-separated env vars to drop before the run (e.g. API keys)
+#   COUNCIL_EXEC_ARGS     extra engine args for execute mode
+#                         (default: --allowedTools Read,Grep,Glob,Bash,Write,Edit --permission-mode acceptEdits)
+#   COUNCIL_ADVISORY_ARGS extra engine args for --advisory
+#                         (default: --allowedTools Read,Grep,Glob)
+#   COUNCIL_PREAMBLE_FILE optional file prepended before the identity (house rules)
+#   COUNCIL_WORKSPACE     directory the engine runs in (default: current directory)
+#   COUNCIL_HOME          Council home, holds IDENTITY.md (default: the repo this script lives in)
+#   COUNCIL_RUNS_DIR      run logs (default: $COUNCIL_HOME/runs)
+#
+# Exit code = engine exit code.
+
+set -euo pipefail
+
+# Resolve COUNCIL_HOME from the real script location (follows symlinks, bash 3.2 safe).
+SRC="${BASH_SOURCE[0]}"
+while [ -L "$SRC" ]; do
+  DIR="$(cd -P "$(dirname "$SRC")" && pwd)"
+  SRC="$(readlink "$SRC")"
+  case "$SRC" in /*) ;; *) SRC="$DIR/$SRC" ;; esac
+done
+HOME_DIR="$(cd -P "$(dirname "$SRC")/.." && pwd)"
+COUNCIL_HOME="${COUNCIL_HOME:-$HOME_DIR}"
+RUNDIR="${COUNCIL_RUNS_DIR:-$COUNCIL_HOME/runs}"
+
+MODEL="${COUNCIL_MODEL:-}"
+TASK_FILE=""
+NO_EXEC=0
+ADVISORY=0
+
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--model)  [ $# -ge 2 ] || { echo "council: $1 needs a value" >&2; exit 1; }; MODEL="$2"; shift 2 ;;
+    -f|--file)   [ $# -ge 2 ] || { echo "council: $1 needs a value" >&2; exit 1; }; TASK_FILE="$2"; shift 2 ;;
+    --advisory)  ADVISORY=1; shift ;;
+    --no-exec)   NO_EXEC=1; shift ;;
+    -h|--help)   usage 0 ;;
+    --)          shift; ARGS+=("$@"); break ;;
+    *)           ARGS+=("$1"); shift ;;
+  esac
+done
+
+if [ -n "$TASK_FILE" ]; then
+  [ -r "$TASK_FILE" ] || { echo "council: cannot read task file: $TASK_FILE" >&2; exit 1; }
+  RAW_TASK="$(cat "$TASK_FILE")"
+elif [ "${#ARGS[@]}" -gt 0 ]; then
+  RAW_TASK="${ARGS[*]}"
+elif [ ! -t 0 ]; then
+  RAW_TASK="$(cat)"
+else
+  echo "council: no task given." >&2; usage 1
+fi
+[ -n "${RAW_TASK//[[:space:]]/}" ] || { echo "council: empty task." >&2; exit 1; }
+
+ENGINE_CLI="${COUNCIL_ENGINE_CLI:-}"
+if [ "$NO_EXEC" -eq 0 ]; then
+  [ -n "$ENGINE_CLI" ] || { echo "council: set COUNCIL_ENGINE_CLI to the engine command" >&2; exit 127; }
+  command -v "$ENGINE_CLI" >/dev/null 2>&1 || { echo "council: engine CLI not found: $ENGINE_CLI" >&2; exit 127; }
+fi
+
+WORKSPACE="${COUNCIL_WORKSPACE:-$PWD}"
+[ -d "$WORKSPACE" ] || { echo "council: workspace not found: $WORKSPACE" >&2; exit 1; }
+
+# --- Preamble (optional house rules) + operator identity ---
+PREAMBLE=""
+if [ -n "${COUNCIL_PREAMBLE_FILE:-}" ]; then
+  [ -r "$COUNCIL_PREAMBLE_FILE" ] || { echo "council: cannot read COUNCIL_PREAMBLE_FILE: $COUNCIL_PREAMBLE_FILE" >&2; exit 1; }
+  PREAMBLE="$(cat "$COUNCIL_PREAMBLE_FILE")"
+fi
+
+IDENTITY=""
+INJECTED_IDENTITY="no (IDENTITY.md missing)"
+if [ -r "$COUNCIL_HOME/IDENTITY.md" ]; then
+  IDENTITY="$(cat "$COUNCIL_HOME/IDENTITY.md")"
+  INJECTED_IDENTITY="yes"
+fi
+
+TASK=""
+[ -z "$PREAMBLE" ] || TASK="$PREAMBLE"$'\n\n---\n\n'
+[ -z "$IDENTITY" ] || TASK="$TASK$IDENTITY"$'\n\n---\n\n'
+TASK="$TASK$RAW_TASK"
+
+if [ "$ADVISORY" -eq 1 ]; then
+  ENGINE_ARGS="${COUNCIL_ADVISORY_ARGS---allowedTools Read,Grep,Glob}"
+else
+  ENGINE_ARGS="${COUNCIL_EXEC_ARGS---allowedTools Read,Grep,Glob,Bash,Write,Edit --permission-mode acceptEdits}"
+fi
+EXTRA=()
+# shellcheck disable=SC2206  # intentional word-splitting of the args string
+[ -z "$ENGINE_ARGS" ] || EXTRA=($ENGINE_ARGS)
+
+UNSET_ARGS=()
+for v in ${COUNCIL_ENV_UNSET:-}; do UNSET_ARGS+=(-u "$v"); done
+
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+SLUG="$(printf '%s' "$RAW_TASK" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | cut -c1-40 | sed 's/-*$//')"
+TASK_SUMMARY="$(printf '%s' "$RAW_TASK" | tr -s '[:space:]' ' ' | cut -c1-140)"
+mkdir -p "$RUNDIR"
+LOG="$RUNDIR/${TS}-${SLUG:-task}.log"
+
+{
+  echo "# Council run"
+  echo "When:     $TS"
+  echo "Engine:   ${ENGINE_CLI:-<none>}"
+  echo "Model:    ${MODEL:-<engine default>}"
+  echo "Mode:     $([ "$ADVISORY" -eq 1 ] && echo advisory || echo execute)"
+  echo "Workdir:  $WORKSPACE"
+  echo "Injected-identity: $INJECTED_IDENTITY"
+  echo "Task:"
+  printf '%s\n' "$TASK_SUMMARY" | sed 's/^/  /'
+} | tee "$LOG"
+
+RC=0
+if [ "$NO_EXEC" -eq 0 ]; then
+  echo "----- council output -----" | tee -a "$LOG"
+  set +e
+  ( cd "$WORKSPACE" && env ${UNSET_ARGS[@]+"${UNSET_ARGS[@]}"} "$ENGINE_CLI" -p "$TASK" \
+      ${MODEL:+--model "$MODEL"} ${EXTRA[@]+"${EXTRA[@]}"} ) 2>&1 | tee -a "$LOG"
+  RC=${PIPESTATUS[0]}
+  set -e
+  echo "----- exit: $RC -----" | tee -a "$LOG"
+else
+  echo "----- --no-exec: engine not run -----" | tee -a "$LOG"
+fi
+
+echo "council: run logged to $LOG" >&2
+exit "$RC"

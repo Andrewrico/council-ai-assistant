@@ -1,0 +1,19 @@
+{
+  "slug": "council",
+  "displayName": "Roger",
+  "description": "Ensemble operator: cross-check, router, executor. Descriptive metadata only; bin/council does not read this file.",
+  "engine": {
+    "cli": "env:COUNCIL_ENGINE_CLI",
+    "model": "env:COUNCIL_MODEL",
+    "envUnset": "env:COUNCIL_ENV_UNSET"
+  },
+  "modes": {
+    "execute": ["Read", "Grep", "Glob", "Bash", "Write", "Edit"],
+    "advisory": ["Read", "Grep", "Glob"]
+  },
+  "identityFile": "IDENTITY.md",
+  "constitutionFile": "CONSTITUTION.md",
+  "skillsDir": "skills-council",
+  "repo": "https://github.com/Andrewrico/council-ai-assistant",
+  "license": "MIT"
+}
